@@ -38,7 +38,7 @@ TASK_STATUS = {
 
 
 def load_database_config():
-    """从 database.ini 加载 Oracle 连接配置"""
+    """从 database.ini 加载数据库连接配置"""
     if not os.path.exists(DATABASE_INI_PATH):
         raise FileNotFoundError(
             f"数据库配置文件不存在: {DATABASE_INI_PATH}\n"
@@ -48,18 +48,27 @@ def load_database_config():
     config = configparser.ConfigParser()
     config.read(DATABASE_INI_PATH, encoding='utf-8')
 
-    if 'oracle' not in config:
-        raise ValueError("database.ini 中缺少 [oracle] 配置节")
+    engine = config.defaults().get('engine', '')
+    if not engine:
+        for section_name in ('mysql', 'oracle'):
+            if section_name in config:
+                engine = config[section_name].get('engine', section_name)
+                break
+    engine = engine.lower() or os.environ.get('DB_ENGINE', 'sqlite').lower()
+    section_name = 'mysql' if engine == 'mysql' and 'mysql' in config else 'oracle'
+    if section_name not in config:
+        raise ValueError(f"database.ini 中缺少 [{section_name}] 配置节")
 
-    section = config['oracle']
+    section = config[section_name]
 
     return {
-        'engine': section.get('engine', 'sqlite'),
-        'host': section.get('host', 'localhost'),
-        'port': int(section.get('port', '1521')),
+        'engine': engine,
+        'host': os.environ.get('DB_HOST', section.get('host', 'localhost')),
+        'port': int(os.environ.get('DB_PORT', section.get('port', '3306' if engine == 'mysql' else '1521'))),
+        'database': os.environ.get('DB_NAME', section.get('database', 'survey')),
         'service_name': section.get('service_name', 'XEPDB1'),
-        'user': section.get('user', 'survey_admin'),
-        'password': section.get('password', ''),
+        'user': os.environ.get('DB_USER', section.get('user', 'survey_admin')),
+        'password': os.environ.get('DB_PASSWORD', section.get('password', '')),
         'min_connections': int(section.get('min_connections', '2')),
         'max_connections': int(section.get('max_connections', '20')),
     }

@@ -154,15 +154,16 @@ def build_login_view(page: ft.Page) -> list:
     role_tabs = ft.SegmentedButton(
         on_change=on_role_change,
         selected=['admin'],
+        width=280,
         segments=[
             ft.Segment(
                 value='admin',
-                label=ft.Text('管理员'),
+                label=ft.Text('管理员', no_wrap=True),
                 icon=ft.Icon(ft.Icons.ADMIN_PANEL_SETTINGS),
             ),
             ft.Segment(
                 value='student',
-                label=ft.Text('医学生'),
+                label=ft.Text('医学生', no_wrap=True),
                 icon=ft.Icon(ft.Icons.SCHOOL),
             ),
         ],

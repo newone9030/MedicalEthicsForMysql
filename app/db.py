@@ -1,5 +1,5 @@
 """
-数据库管理器（双模式：SQLite / Oracle）
+数据库管理器（SQLite / MySQL / Oracle）
 - 默认使用 SQLite，无需额外配置即可运行
 - 当 database.ini 中 engine=oracle 且 Oracle 可用时切换至 Oracle 模式
 """
@@ -12,9 +12,10 @@ from contextlib import contextmanager
 from app.config import load_database_config, BASE_DIR
 
 # 全局状态
-_engine = None           # 'sqlite' 或 'oracle'
+_engine = None           # 'sqlite'、'mysql' 或 'oracle'
 _sqlite_conn = None      # SQLite 单连接
 _oracle_pool = None      # Oracle 连接池
+_mysql_pool = None       # MySQL 连接池
 _lock = threading.Lock()
 _sqlite_lock = threading.RLock()   # SQLite 单连接并发访问锁（可重入，支持嵌套 get_connection）
 _initialized = False
@@ -282,6 +283,102 @@ def _init_oracle():
     print(f"[DB] Oracle 连接池已创建 (min={config['min_connections']}, max={config['max_connections']})")
 
 
+def _init_mysql():
+    """初始化 MySQL 连接池并确保业务表存在"""
+    global _mysql_pool
+    import mysql.connector.pooling
+
+    config = load_database_config()
+    _mysql_pool = mysql.connector.pooling.MySQLConnectionPool(
+        pool_name='survey_pool',
+        pool_size=config['max_connections'],
+        host=config['host'],
+        port=config['port'],
+        database=config['database'],
+        user=config['user'],
+        password=config['password'],
+        charset='utf8mb4',
+        collation='utf8mb4_unicode_ci',
+    )
+    with _mysql_pool.get_connection() as conn:
+        cursor = conn.cursor()
+        for statement in _MYSQL_TABLES:
+            cursor.execute(statement)
+        conn.commit()
+    print(f"[DB] MySQL 连接池已创建 ({config['host']}:{config['port']}/{config['database']})")
+
+
+_MYSQL_TABLES = [
+    """CREATE TABLE IF NOT EXISTS users (
+        id INT PRIMARY KEY AUTO_INCREMENT, username VARCHAR(50) UNIQUE NOT NULL,
+        password_hash VARCHAR(128) NOT NULL, salt VARCHAR(64) NOT NULL,
+        role VARCHAR(10) NOT NULL, real_name VARCHAR(50), class_name VARCHAR(100),
+        student_id VARCHAR(50), user_type VARCHAR(10) DEFAULT 'formal',
+        status VARCHAR(10) DEFAULT 'active', must_change_password TINYINT DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS cases (
+        id INT PRIMARY KEY AUTO_INCREMENT, title VARCHAR(200) NOT NULL, body TEXT,
+        theme VARCHAR(50), created_by INT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        FOREIGN KEY (created_by) REFERENCES users(id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS case_questions (
+        id INT PRIMARY KEY AUTO_INCREMENT, case_id INT NOT NULL, question_text VARCHAR(500) NOT NULL,
+        question_type VARCHAR(20) NOT NULL, options TEXT, hint VARCHAR(500), sort_order INT DEFAULT 0,
+        open_text_enabled TINYINT DEFAULT 0, open_text_title VARCHAR(200), open_text_hint VARCHAR(500),
+        section_title VARCHAR(200), is_required TINYINT DEFAULT 1,
+        FOREIGN KEY (case_id) REFERENCES cases(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS tasks (
+        id INT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(200) NOT NULL, description TEXT,
+        start_time DATETIME, end_time DATETIME, status VARCHAR(20) DEFAULT 'draft',
+        task_type VARCHAR(20) DEFAULT 'survey', sort_order INT DEFAULT 0, created_by INT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (created_by) REFERENCES users(id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS task_cases (
+        id INT PRIMARY KEY AUTO_INCREMENT, task_id INT NOT NULL, case_id INT NOT NULL, sort_order INT DEFAULT 0,
+        UNIQUE KEY uk_task_case (task_id, case_id), FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+        FOREIGN KEY (case_id) REFERENCES cases(id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS responses (
+        id INT PRIMARY KEY AUTO_INCREMENT, task_id INT NOT NULL, case_id INT NOT NULL, student_id INT NOT NULL,
+        status VARCHAR(10) DEFAULT 'draft', submitted_at DATETIME, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        UNIQUE KEY uk_response (task_id, case_id, student_id), FOREIGN KEY (task_id) REFERENCES tasks(id),
+        FOREIGN KEY (case_id) REFERENCES cases(id), FOREIGN KEY (student_id) REFERENCES users(id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS response_details (
+        id INT PRIMARY KEY AUTO_INCREMENT, response_id INT NOT NULL, question_id INT NOT NULL, answer TEXT,
+        FOREIGN KEY (response_id) REFERENCES responses(id) ON DELETE CASCADE, FOREIGN KEY (question_id) REFERENCES case_questions(id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS feedback_tasks (
+        id INT PRIMARY KEY AUTO_INCREMENT, title VARCHAR(200) NOT NULL, description TEXT,
+        page_category VARCHAR(20) NOT NULL DEFAULT 'case', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS feedback_questions (
+        id INT PRIMARY KEY AUTO_INCREMENT, task_id INT NOT NULL, question_text TEXT NOT NULL,
+        question_type VARCHAR(10) NOT NULL DEFAULT 'radio', sort_order INT DEFAULT 0, required TINYINT DEFAULT 0,
+        FOREIGN KEY (task_id) REFERENCES feedback_tasks(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS feedback_question_options (
+        id INT PRIMARY KEY AUTO_INCREMENT, question_id INT NOT NULL, label TEXT NOT NULL, value INT NOT NULL,
+        sort_order INT DEFAULT 0, requires_comment TINYINT DEFAULT 0, comment_hint TEXT,
+        FOREIGN KEY (question_id) REFERENCES feedback_questions(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS feedback_task_mappings (
+        id INT PRIMARY KEY AUTO_INCREMENT, task_id INT NOT NULL, survey_question_id INT NOT NULL,
+        UNIQUE KEY uk_feedback_mapping (task_id, survey_question_id), FOREIGN KEY (task_id) REFERENCES feedback_tasks(id) ON DELETE CASCADE,
+        FOREIGN KEY (survey_question_id) REFERENCES case_questions(id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS feedback_responses (
+        id INT PRIMARY KEY AUTO_INCREMENT, student_id INT NOT NULL, survey_question_id INT,
+        feedback_question_id INT NOT NULL, selected_option_id INT, comment_text TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (student_id) REFERENCES users(id), FOREIGN KEY (feedback_question_id) REFERENCES feedback_questions(id),
+        FOREIGN KEY (selected_option_id) REFERENCES feedback_question_options(id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+]
+
+
 def get_engine():
     """获取当前数据库引擎类型"""
     global _engine, _initialized
@@ -300,6 +397,11 @@ def _init_db():
         config = load_database_config()
         engine_config = config.get('engine', 'sqlite').lower()
 
+        if engine_config == 'mysql':
+            _init_mysql()
+            _engine = 'mysql'
+            _initialized = True
+            return
         if engine_config == 'oracle':
             try:
                 _init_oracle()
@@ -427,6 +529,43 @@ class _SqliteConnectionWrapper:
         return getattr(self._conn, name)
 
 
+def _mysql_sql_and_params(sql, params):
+    """将业务层的命名参数或问号参数转换为 MySQL Connector 格式"""
+    import re
+    sql = sql.replace('last_insert_rowid()', 'LAST_INSERT_ID()')
+    if isinstance(params, dict):
+        names = re.findall(r':([A-Za-z_]\w*)', sql)
+        return re.sub(r':([A-Za-z_]\w*)', '%s', sql), tuple(params[name] for name in names)
+    return sql.replace('?', '%s'), params
+
+
+class _MysqlCursorWrapper:
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def execute(self, sql, params=None):
+        sql, params = _mysql_sql_and_params(sql, params)
+        return self._cursor.execute(sql, params)
+
+    def executemany(self, sql, params_list):
+        sql, _ = _mysql_sql_and_params(sql, None)
+        return self._cursor.executemany(sql, params_list)
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
+class _MysqlConnectionWrapper:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def cursor(self):
+        return _MysqlCursorWrapper(self._conn.cursor())
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
 @contextmanager
 def get_connection():
     """获取数据库连接（上下文管理器）"""
@@ -434,7 +573,13 @@ def get_connection():
     if not _initialized:
         _init_db()
 
-    if _engine == 'oracle':
+    if _engine == 'mysql':
+        conn = _mysql_pool.get_connection()
+        try:
+            yield _MysqlConnectionWrapper(conn)
+        finally:
+            conn.close()
+    elif _engine == 'oracle':
         conn = _oracle_pool.acquire()
         try:
             yield conn
@@ -453,7 +598,20 @@ def execute_sql(sql, params=None, fetch=False):
 
     sql = _adapt_sql(sql)
 
-    if _engine == 'oracle':
+    if _engine == 'mysql':
+        conn = _mysql_pool.get_connection()
+        try:
+            cursor = _MysqlCursorWrapper(conn.cursor())
+            cursor.execute(sql, params)
+            result = cursor.fetchall() if fetch else cursor
+            conn.commit()
+            return result
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    elif _engine == 'oracle':
         conn = _oracle_pool.acquire()
         try:
             cursor = conn.cursor()
@@ -493,6 +651,9 @@ def execute_sql(sql, params=None, fetch=False):
 
 def get_last_rowid(table_name):
     """获取最后插入行的 ID"""
+    if _engine == 'mysql':
+        rows = execute_sql('SELECT LAST_INSERT_ID()', fetch=True)
+        return rows[0][0] if rows else None
     if _engine == 'oracle':
         seq_map = {
             'cases': 'seq_cases',
@@ -514,7 +675,7 @@ def get_last_rowid(table_name):
 
 def close_db():
     """关闭数据库连接"""
-    global _sqlite_conn, _oracle_pool, _initialized
+    global _sqlite_conn, _oracle_pool, _mysql_pool, _initialized, _engine
     if _sqlite_conn:
         _sqlite_conn.close()
         _sqlite_conn = None
@@ -523,6 +684,9 @@ def close_db():
         _oracle_pool.close()
         _oracle_pool = None
         print("[DB] Oracle 连接池已关闭")
+    if _mysql_pool:
+        _mysql_pool = None
+        print("[DB] MySQL 连接池已关闭")
     _initialized = False
     _engine = None
 
@@ -531,6 +695,10 @@ def test_connection():
     """测试数据库连接"""
     if not _initialized:
         _init_db()
+    if _engine == 'mysql':
+        rows = execute_sql("SELECT 'MySQL连接成功'", fetch=True)
+        print(f"[DB] {rows[0][0]}")
+        return True
     if _engine == 'oracle':
         with get_connection() as conn:
             cursor = conn.cursor()
