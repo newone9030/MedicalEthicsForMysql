@@ -1082,5 +1082,5 @@ import os
 
 if __name__ == '__main__':
    ft.app(target=main, view=ft.AppView.WEB_BROWSER, port=int(os.environ.get('PORT', 8080))
-       , host='0.0.0.0',web_renderer=ft.WebRenderer.CANVAS_KIT)
+    , host='0.0.0.0',web_renderer=ft.WebRenderer.CANVAS_KIT)
     ##ft.app(target=main, view=ft.AppView.WEB_BROWSER)
